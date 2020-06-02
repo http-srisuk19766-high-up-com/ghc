@@ -941,10 +941,6 @@ lintCoreExpr e@(App _ _)
        ; app_ty <- lintValApp arg3 fun_ty2 arg3_ty ue2 ue3
        ; lintCoreArgs app_ty rest }
 
-  | Var fun <- fun
-  , fun `hasKey` runRWKey
-  = failWithL (text "Invalid runRW# application")
-
   | otherwise
   = do { pair <- lintCoreFun fun (length args)
        ; lintCoreArgs pair args }
