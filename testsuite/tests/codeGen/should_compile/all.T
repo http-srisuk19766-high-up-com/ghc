@@ -6,8 +6,6 @@ test('cg005', only_ways(['optasm']), compile, [''])
 test('cg006', normal, compile, [''])
 test('cg007', normal, compile, [''])
 test('cg008', normal, compile, [''])
-# 009/010 have their own all.T file
-test('cg011', normal, compile, [''])
 
 test('T1916', normal, compile, [''])
 test('T2388', normal, compile, [''])
@@ -91,6 +89,7 @@ test('T17648', normal, makefile_test, [])
 test('T17904', normal, compile, ['-O'])
 test('T18227A', normal, compile, [''])
 test('T18227B', normal, compile, [''])
+test('T18291', normal, compile, ['-O0'])
 test('T15570',
    when(unregisterised(), skip),
    compile, ['-Wno-overflowed-literals'])
