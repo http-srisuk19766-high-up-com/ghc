@@ -595,9 +595,8 @@ translateConPatOut fam_insts x con univ_tys ex_tvs dicts = \case
 
     go_field_pats tagged_pats = do
       -- The fields that appear might not be in the correct order. So first
-      -- do a PmCon match, then force according to field strictness and then
-      -- force evaluation of the field patterns in the order given by
-      -- the first field of @tagged_pats@.
+      -- do a PmCon match, then pattern match on the fields in the order given
+      -- by the first field of @tagged_pats@.
       -- See Note [Field match order for RecCon]
 
       -- Translate the mentioned field patterns. We're doing this first to get
@@ -611,22 +610,15 @@ translateConPatOut fam_insts x con univ_tys ex_tvs dicts = \case
             Just var -> pure var
             Nothing  -> mkPmId ty
 
-      -- 1. the constructor pattern match itself
+      -- the constructor pattern match itself
       arg_ids <- zipWithM get_pat_id [0..] arg_tys
       let con_grd = PmCon x (PmAltConLike con) ex_tvs dicts arg_ids
 
-      -- 2. bang strict fields
-      let arg_is_banged = map isBanged $ conLikeImplBangs con
-          bang_grds     = map PmBang   $ filterByList arg_is_banged arg_ids
-
-      -- 3. guards from field selector patterns
+      -- guards from field selector patterns
       let arg_grds = concat arg_grdss
 
       -- tracePm "ConPatOut" (ppr x $$ ppr con $$ ppr arg_ids)
-      --
-      -- Store the guards in exactly that order
-      --      1.         2.           3.
-      pure (con_grd : bang_grds ++ arg_grds)
+      pure (con_grd : arg_grds)
 
 mkGrdTreeRhs :: Located SDoc -> GrdVec -> GrdTree
 mkGrdTreeRhs sdoc = foldr Guard (Rhs sdoc)
@@ -708,23 +700,37 @@ translateBoolGuard e
 The order for RecCon field patterns actually determines evaluation order of
 the pattern match. For example:
 
-  data T = T { a :: !Bool, b :: Char, c :: Int }
+  data T = T { a :: Char, b :: Int }
   f :: T -> ()
-  f T{ c = 42, b = 'b' } = ()
+  f T{ b = 42, a = 'a' } = ()
 
-Then
-  * @f (T (error "a") (error "b") (error "c"))@ errors out with "a" because of
-    the strict field.
-  * @f (T True        (error "b") (error "c"))@ errors out with "c" because it
-    is mentioned frist in the pattern match.
+Then @f (T (error "a") (error "b"))@ errors out with "b" because it is mentioned
+frist in the pattern match.
 
-This means we can't just desugar the pattern match to the PatVec
-@[T !_ 'b' 42]@. Instead we have to generate variable matches that have
-strictness according to the field declarations and afterwards force them in the
-right order. As a result, we get the PatVec @[T !_ b c, 42 <- c, 'b' <- b]@.
+This means we can't just desugar the pattern match to
+@[T a b <- x, 'a' <- a, 42 <- b]@. Instead we have to force them in the
+right order: @[T a b <- x, 42 <- b, 'a' <- a]@.
 
-Of course, when the labels occur in the order they are defined, we can just use
-the simpler desugaring.
+Note [Strict fields and fields of unlifted type]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+How do strict fields play into Note [Field match order for RecCon]? Answer:
+They don't. Desugaring is entirely unconcerned by strict fields; the forcing
+happens *before* pattern matching. But for each strict (or more generally,
+unlifted) field @s@ we have to add @s /~ ⊥@ constraints, *but only when we check
+the guard tree*. Strict fields are devoid of ⊥ by construction, there's nothing
+that a bang pattern would act on. Example from #18341:
+
+  data T = MkT !Int
+  f :: T -> ()
+  f (MkT  _) | False = () -- inaccessible
+  f (MkT !_) | False = () -- redundant, not only inaccessible!
+  f _                = ()
+
+We add the @s /~ ⊥@ constraints in 'pmConCts'. Note that because the 'PmBang'
+guards added by desugaring (which correspond to bang patterns) occur *after* the
+'PmCon' guard, they will observe the unliftedness constraints on strict fields
+that the 'PmCon' disperses into. So the bang pattern in the second clause above
+will actually be detected as redundant.
 
 Note [Order of guards matters]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -931,6 +937,26 @@ mayDiverge :: AnnotatedTree -> AnnotatedTree
 mayDiverge a@(MayDiverge _) = a
 mayDiverge a                = MayDiverge a
 
+-- | Translates a 'PmCon' @T gammas as ys <- x@ guard into lower level 'PmCts'.
+-- These include
+--
+--   * @gammas@: Constraints arising from the bound evidence vars
+--   * @y /~ ⊥@ constraitns for each unlifted field (including strict fields)
+--     @y@ in @ys@
+--   * The constructor constraint itself: @x ~ T as ys@.
+--
+-- See Note [Strict fields and fields of unlifted type].
+pmConCts :: Id -> PmAltCon -> [TyVar] -> [EvVar] -> [Id] -> PmCts
+pmConCts x con tvs dicts args = gammas `unionBags` unlifted `snocBag` con_ct
+  where
+    gammas   = listToBag $ map (PmTyCt . evVarPred) dicts
+    con_ct   = PmConCt x con tvs args
+    unlifted = listToBag [ PmNotBotCt arg
+                         | (arg, bang) <-
+                             zipEqual "pmConCts" args (pmAltConImplBangs con)
+                         , isBanged bang || isUnliftedType (idType arg)
+                         ]
+
 -- | Computes two things:
 --
 --   * The set of uncovered values not matched by any of the clauses of the
@@ -957,6 +983,7 @@ checkGrdTree' (Guard (PmLet x e) tree) deltas = do
 -- Bang x: Diverge on x ~ ⊥, refine with x /~ ⊥
 checkGrdTree' (Guard (PmBang x) tree) deltas = do
   has_diverged <- addPmCtDeltas deltas (PmBotCt x) >>= isInhabited
+  tracePm "checkGrdTree':PmBang" (ppr deltas $$ ppr has_diverged $$ ppr x)
   deltas' <- addPmCtDeltas deltas (PmNotBotCt x)
   res <- checkGrdTree' tree deltas'
   pure res{ cr_clauses = applyWhen has_diverged mayDiverge (cr_clauses res) }
@@ -968,8 +995,8 @@ checkGrdTree' (Guard (PmCon x con tvs dicts args) tree) deltas = do
       then addPmCtDeltas deltas (PmBotCt x) >>= isInhabited
       else pure False
   unc_this <- addPmCtDeltas deltas (PmNotConCt x con)
-  deltas' <- addPmCtsDeltas deltas $
-    listToBag (PmTyCt . evVarPred <$> dicts) `snocBag` PmConCt x con tvs args
+  tracePm "checkGrdTree'" (ppr deltas $$ ppr has_diverged $$ ppr (pmConCts x con tvs dicts args))
+  deltas' <- addPmCtsDeltas deltas (pmConCts x con tvs dicts args)
   CheckResult tree' unc_inner prec <- checkGrdTree' tree deltas'
   limit <- maxPmCheckModels <$> getDynFlags
   let (prec', unc') = throttle limit deltas (unc_this Semi.<> unc_inner)
