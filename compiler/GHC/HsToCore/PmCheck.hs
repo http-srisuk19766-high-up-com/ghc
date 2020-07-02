@@ -992,19 +992,21 @@ checkGrdTree' (Rhs sdoc) deltas = do
 -- let x = e: Refine with x ~ e
 checkGrdTree' (Guard (PmLet x e) tree) deltas = do
   deltas' <- addPmCtDeltas deltas (PmCoreCt x e)
+  tracePm "check:Let" (ppr x <+> char '=' <+> ppr e)
   checkGrdTree' tree deltas'
 -- Bang x: Diverge on x ~ ⊥, refine with x /~ ⊥
 checkGrdTree' (Guard (PmBang x) tree) deltas = do
   has_diverged <- addPmCtDeltas deltas (PmBotCt x) >>= isInhabited
-  tracePm "checkGrdTree':PmBang" (ppr deltas $$ ppr has_diverged $$ ppr x)
   deltas' <- addPmCtDeltas deltas (PmNotBotCt x)
+  tracePm "check:Bang" (ppr x <+> ppr has_diverged $$ ppr deltas')
   res <- checkGrdTree' tree deltas'
   pure res{ cr_clauses = applyWhen has_diverged mayDiverge (cr_clauses res) }
 -- Con: Fall through on x /~ K, refine with x ~ K ys and type info
 checkGrdTree' (Guard (PmCon x con tvs dicts args) tree) deltas = do
   unc_this <- addPmCtDeltas deltas (PmNotConCt x con)
-  tracePm "checkGrdTree'" (ppr deltas $$ ppr (pmConCts x con tvs dicts args))
-  deltas' <- addPmCtsDeltas deltas (pmConCts x con tvs dicts args)
+  let cts = pmConCts x con tvs dicts args
+  tracePm "check:Con" (ppr cts)
+  deltas' <- addPmCtsDeltas deltas cts
   CheckResult tree' unc_inner prec <- checkGrdTree' tree deltas'
   limit <- maxPmCheckModels <$> getDynFlags
   let (prec', unc') = throttle limit deltas (unc_this Semi.<> unc_inner)
@@ -1014,6 +1016,7 @@ checkGrdTree' (Guard (PmCon x con tvs dicts args) tree) deltas = do
     , cr_approx = prec Semi.<> prec' }
 -- Sequence: Thread residual uncovered sets from equation to equation
 checkGrdTree' (Sequence l r) unc_0 = do
+  tracePm "check:Sequence:l" (ppr l)
   CheckResult l' unc_1 prec_l <- checkGrdTree' l unc_0
   CheckResult r' unc_2 prec_r <- checkGrdTree' r unc_1
   pure CheckResult
