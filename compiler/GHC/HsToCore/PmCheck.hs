@@ -1018,6 +1018,7 @@ checkGrdTree' (Guard (PmCon x con tvs dicts args) tree) deltas = do
 checkGrdTree' (Sequence l r) unc_0 = do
   tracePm "check:Sequence:l" (ppr l)
   CheckResult l' unc_1 prec_l <- checkGrdTree' l unc_0
+  tracePm "check:Sequence:r" (ppr r)
   CheckResult r' unc_2 prec_r <- checkGrdTree' r unc_1
   pure CheckResult
     { cr_clauses = SequenceAnn l' r'
