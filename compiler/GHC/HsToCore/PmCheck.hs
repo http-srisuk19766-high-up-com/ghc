@@ -1005,8 +1005,8 @@ checkGrdTree' (Guard (PmBang x) tree) deltas = do
 checkGrdTree' (Guard (PmCon x con tvs dicts args) tree) deltas = do
   unc_this <- addPmCtDeltas deltas (PmNotConCt x con)
   let cts = pmConCts x con tvs dicts args
-  tracePm "check:Con" (ppr cts)
   deltas' <- addPmCtsDeltas deltas cts
+  tracePm "check:Con" (ppr cts)
   CheckResult tree' unc_inner prec <- checkGrdTree' tree deltas'
   limit <- maxPmCheckModels <$> getDynFlags
   let (prec', unc') = throttle limit deltas (unc_this Semi.<> unc_inner)
