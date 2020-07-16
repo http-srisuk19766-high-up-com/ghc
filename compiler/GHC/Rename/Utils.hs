@@ -26,8 +26,10 @@ module GHC.Rename.Utils (
 
         bindLocalNames, bindLocalNamesFV,
 
-        addNameClashErrRn, extendTyVarEnvFVRn
+        addNameClashErrRn, extendTyVarEnvFVRn,
 
+        checkInferredVars,
+        noNestedForallsContextsErr, addNoNestedForallsContextsErr
 )
 
 where
@@ -35,6 +37,7 @@ where
 
 import GHC.Prelude
 
+import GHC.Core.Type
 import GHC.Hs
 import GHC.Types.Name.Reader
 import GHC.Driver.Types
@@ -49,6 +52,7 @@ import GHC.Utils.Outputable
 import GHC.Utils.Misc
 import GHC.Types.Basic  ( TopLevelFlag(..) )
 import GHC.Data.List.SetOps ( removeDups )
+import GHC.Data.Maybe ( whenIsJust )
 import GHC.Driver.Session
 import GHC.Data.FastString
 import Control.Monad
@@ -176,6 +180,137 @@ checkShadowedOccs (global_env,local_env) get_loc_occ ns
                              || xopt LangExt.RecordWildCards dflags) }
     is_shadowed_gre _other = return True
 
+-------------------------------------
+-- | Throw an error message if a user attempts to quantify an inferred type
+-- variable in a place where specificity cannot be observed.
+-- See @Note [Unobservably inferred type variables]@.
+checkInferredVars :: HsDocContext
+                  -> Maybe SDoc
+                  -- ^ The error msg if the signature is not allowed to contain
+                  --   manually written inferred variables.
+                  -> LHsSigType GhcPs
+                  -> RnM ()
+checkInferredVars _    Nothing    _  = return ()
+checkInferredVars ctxt (Just msg) ty =
+  let bndrs = forallty_bndrs (hsSigType ty)
+  in case find ((==) InferredSpec . hsTyVarBndrFlag) bndrs of
+    Nothing -> return ()
+    Just _  -> addErr $ withHsDocContext ctxt msg
+  where
+    forallty_bndrs :: LHsType GhcPs -> [HsTyVarBndr Specificity GhcPs]
+    forallty_bndrs (L _ ty) = case ty of
+      HsParTy _ ty' -> forallty_bndrs ty'
+      HsForAllTy { hst_tele = HsForAllInvis { hsf_invis_bndrs = tvs }}
+                    -> map unLoc tvs
+      _             -> []
+
+{-
+Note [Unobservably inferred type variables]
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+While GHC's parser allows the use of inferred type variables
+(e.g., `forall {a}. <...>`) just about anywhere that type variable binders can
+appear, there are some situations where the distinction between inferred and
+specified type variables cannot be observed. For example, consider this
+instance declaration:
+
+  instance forall {a}. Eq (T a) where ...
+
+Making {a} inferred is essentially pointless, as there is no way for user code
+to "apply" an instance declaration in a way where the inferred/specified
+distinction would make a difference. Anyone who writes such code is likely
+confused, so in an attempt to be helpful, we throw an error message if a user
+writes code like this. The checkInferredVars function is responsible for
+implementing this restriction.
+
+It turns out to be somewhat cumbersome to enforce this restriction in certain
+cases. Ultimately, nothing goes wrong if this restriction is *not* enforced (as
+it is simply a suggestion to the user to think twice about how they quantify
+their type variables), so we only use checkInferredVars in places where it is
+feasible to do so. Two examples of places where it is *not* feasible are:
+
+* Quantified constraints. In the type `f :: (forall {a}. C a) => Proxy Int`,
+  there is no way to observe that {a} is inferred. Nevertheless, actually
+  rejecting this code would be tricky, as we would need to reject
+  `forall {a}. <...>` as a constraint but *accept* other uses of
+  `forall {a}. <...>` as a type (e.g., `g :: (forall {a}. a -> a) -> b -> b`).
+  This is quite tedious to do in practice, so we don't bother.
+* Default method type signatures (#18432). These are tricky because inferred
+  type variables can appear nested, e.g.,
+
+    class C a where
+      m         :: forall b. a -> b -> forall c.   c -> c
+      default m :: forall b. a -> b -> forall {c}. c -> c
+      m _ _ = id
+
+  Robustly checking for nested, inferred type variables ends up being a pain,
+  so we don't try to do this.
+
+Since nested type variables are a pain, one might wonder if they end up being
+painful for other places where we *do* enforce this restriction. The answer is
+"no", as it turns out. This is because in every other place where the
+restriction is enforced, GHC bans the use of nested `forall`s already. For
+example, GHC would not accept the following:
+
+  instance forall a. forall {b}. Eq (Either a b) where ...
+
+The fact that GHC does not permit nested `forall`s there is a bit of a
+coincidence (see Note [No nested foralls or contexts in instance types] in
+GHC.Hs.Type). But is sure is a useful coincidence, and one that we take
+advantage of. Because nested `forall`s are banned, checking for inferred
+type variables in instance declarations is as simple as peeling off the
+outer `forall`s and checking if any of them are inferred.
+-}
+
+-- | Examines a non-outermost type for @forall@s or contexts, which are assumed
+-- to be nested. For example, in the following declaration:
+--
+-- @
+-- instance forall a. forall b. C (Either a b)
+-- @
+--
+-- The outermost @forall a@ is fine, but the nested @forall b@ is not. We
+-- invoke 'noNestedForallsContextsErr' on the type @forall b. C (Either a b)@
+-- to catch the nested @forall@ and create a suitable error message.
+-- 'noNestedForallsContextsErr' returns @'Just' err_msg@ if such a @forall@ or
+-- context is found, and returns @Nothing@ otherwise.
+--
+-- This is currently used in the following places:
+--
+-- * In GADT constructor types (in 'rnConDecl').
+--   See @Note [GADT abstract syntax] (Wrinkle: No nested foralls or contexts)@
+--   in "GHC.Hs.Type".
+--
+-- * In instance declaration types (in 'rnClsIntDecl' and 'rnSrcDerivDecl' in
+--   "GHC.Rename.Module" and 'renameSig' in "GHC.Rename.Bind").
+--   See @Note [No nested foralls or contexts in instance types]@ in
+--   "GHC.Hs.Type".
+noNestedForallsContextsErr :: SDoc -> LHsType GhcRn -> Maybe (SrcSpan, SDoc)
+noNestedForallsContextsErr what lty =
+  case ignoreParens lty of
+    L l (HsForAllTy { hst_tele = tele })
+      |  HsForAllVis{} <- tele
+         -- The only two places where this function is called correspond to
+         -- types of terms, so we give a slightly more descriptive error
+         -- message in the event that they contain visible dependent
+         -- quantification (currently only allowed in kinds).
+      -> Just (l, vcat [ text "Illegal visible, dependent quantification" <+>
+                         text "in the type of a term"
+                       , text "(GHC does not yet support this)" ])
+      |  HsForAllInvis{} <- tele
+      -> Just (l, nested_foralls_contexts_err)
+    L l (HsQualTy {})
+      -> Just (l, nested_foralls_contexts_err)
+    _ -> Nothing
+  where
+    nested_foralls_contexts_err =
+      what <+> text "cannot contain nested"
+      <+> quotes forAllLit <> text "s or contexts"
+
+-- | A common way to invoke 'noNestedForallsContextsErr'.
+addNoNestedForallsContextsErr :: HsDocContext -> SDoc -> LHsType GhcRn -> RnM ()
+addNoNestedForallsContextsErr ctxt what lty =
+  whenIsJust (noNestedForallsContextsErr what lty) $ \(l, err_msg) ->
+    addErrAt l $ withHsDocContext ctxt err_msg
 
 {-
 ************************************************************************
